@@ -1,229 +1,186 @@
-import ccxt
+import sys
+import requests
 import pandas as pd
 import numpy as np
-from ta.momentum import RSIIndicator
-from ta.trend import ADXIndicator
-from ta.volatility import AverageTrueRange
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
+from itertools import product
 
-# ------------------------
-# CONFIG
-# ------------------------
+# ==================== CONFIG ====================
 
-SYMBOL = "ETH/USDT"
-TIMEFRAME = "1m"
-HOURS = 24 * 7
+SYMBOL = "ETHUSDT"
+INTERVAL_BASE = "1m"
+HOURS = 24
+LIMIT = 1000
+REQUEST_TIMEOUT = 10
 
-exchange = ccxt.bybit({
-    "enableRateLimit": True
-})
+SLIPPAGE = 0.001
+COMMISSION = 0.001
+BASE_CAPITAL = 1000
 
-# ------------------------
-# FETCH DATA
-# ------------------------
+PERIOD_RANGE = [2,4,6,8,10,12,14,16]
+ADX_TH_RANGE = [20,25,30]
+RSI_LOW_RANGE = [20,25,30,35,40]
+RSI_HIGH_RANGE = [60,65,70,75,80]
+MULT_STOP_RANGE = [1.0,1.5,2.0,2.5,3.0]
+MULT_TP_RANGE = [1.0,1.5,2.0,2.5,3.0]
+USE_SLOPE_OPTIONS = [False,True]
 
-def fetch_data():
-    since = exchange.parse8601(
-        (datetime.utcnow() - timedelta(hours=HOURS)).isoformat()
-    )
+TIMEFRAMES = {
+    "1m":"1min",
+    "3m":"3min",
+    "5m":"5min"
+}
 
-    all_ohlc = []
+# ==================== FETCH BINANCE (SIN CLOUDFRONT) ====================
 
-    while True:
-        ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
-        if not ohlc:
-            break
+def fetch_klines_binance(symbol, interval, hours):
+    endpoints = [
+        "https://api.binance.com/api/v3/klines",
+        "https://api1.binance.com/api/v3/klines",
+        "https://api2.binance.com/api/v3/klines",
+        "https://api3.binance.com/api/v3/klines"
+    ]
 
-        since = ohlc[-1][0] + 1
-        all_ohlc += ohlc
+    end_time = int(time.time() * 1000)
+    start_time = end_time - hours * 60 * 60 * 1000
 
-        if len(ohlc) < 1000:
-            break
+    for endpoint in endpoints:
+        try:
+            print(f"Intentando Binance: {endpoint}")
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "startTime": start_time,
+                "limit": LIMIT
+            }
 
-    df = pd.DataFrame(
-        all_ohlc,
-        columns=["timestamp","open","high","low","close","volume"]
-    )
+            resp = requests.get(endpoint, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df.set_index("timestamp", inplace=True)
+            if data:
+                return process_klines(data)
 
+        except Exception as e:
+            print("Error:", str(e)[:60])
+
+    return None
+
+
+def fetch_klines_bybit(symbol, interval, hours):
+    try:
+        print("Intentando Bybit...")
+        url = "https://api.bybit.com/v5/market/kline"
+
+        interval_map = {"1m":"1","3m":"3","5m":"5"}
+        end_time = int(time.time())
+        start_time = end_time - hours*60*60
+
+        params = {
+            "category":"spot",
+            "symbol":symbol,
+            "interval":interval_map.get(interval,"1"),
+            "start":start_time*1000,
+            "end":end_time*1000,
+            "limit":LIMIT
+        }
+
+        resp = requests.get(url,params=params,timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data["retCode"] == 0:
+            klines = data["result"]["list"]
+            klines.reverse()
+
+            formatted = []
+            for k in klines:
+                formatted.append([
+                    int(k[0]),
+                    float(k[1]),
+                    float(k[2]),
+                    float(k[3]),
+                    float(k[4]),
+                    float(k[5]),
+                    0,0,0,0,0,0
+                ])
+
+            return process_klines(formatted)
+
+    except Exception as e:
+        print("Bybit error:", str(e)[:60])
+
+    return None
+
+
+def process_klines(klines):
+    cols = [
+        "timestamp","open","high","low","close","volume",
+        "c1","c2","c3","c4","c5","c6"
+    ]
+
+    df = pd.DataFrame(klines,columns=cols)
+    df["timestamp"] = pd.to_datetime(df["timestamp"],unit="ms")
+    df.set_index("timestamp",inplace=True)
+
+    for c in ["open","high","low","close"]:
+        df[c] = df[c].astype(float)
+
+    return df[["open","high","low","close","volume"]]
+
+
+def fetch_with_fallback():
+    df = fetch_klines_binance(SYMBOL,INTERVAL_BASE,HOURS)
+    if df is not None and not df.empty:
+        return df
+
+    df = fetch_klines_bybit(SYMBOL,INTERVAL_BASE,HOURS)
     return df
 
-# ------------------------
-# RESAMPLE 3M
-# ------------------------
 
-def resample_3m(df):
-    df_3m = df.resample("3min").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    })
-    df_3m.dropna(inplace=True)
-    return df_3m
+# ==================== INDICADORES ====================
 
-# ------------------------
-# BACKTEST
-# ------------------------
-
-def backtest(df):
-
-    df["RSI"] = RSIIndicator(df["close"], window=10).rsi()
-    df["ADX"] = ADXIndicator(df["high"], df["low"], df["close"], window=10).adx()
-    df["ATR"] = AverageTrueRange(df["high"], df["low"], df["close"], window=5).average_true_range()
-
-    capital = 10000
-    position = None
-    entry_price = 0
-    stop = 0
-    tp = 0
-    extreme = 0
-    trades = []
-
-    for i in range(20, len(df)):
-        row = df.iloc[i]
-
-        if position is None:
-
-            if row["ADX"] > 20 and row["RSI"] < 30:
-                position = "long"
-                entry_price = row["close"]
-                stop = entry_price - 2 * row["ATR"]
-                tp = entry_price + 2.5 * row["ATR"]
-                extreme = entry_price
-
-            elif row["ADX"] > 20 and row["RSI"] > 70:
-                position = "short"
-                entry_price = row["close"]
-                stop = entry_price + 2 * row["ATR"]
-                tp = entry_price - 2.5 * row["ATR"]
-                extreme = entry_price
-
-        else:
-
-            if position == "long":
-                extreme = max(extreme, row["high"])
-                stop = extreme - 2 * row["ATR"]
-
-                if row["low"] <= stop or row["high"] >= tp:
-                    exit_price = stop if row["low"] <= stop else tp
-                    profit = exit_price - entry_price
-                    capital += profit
-                    trades.append(profit)
-                    position = None
-
-            elif position == "short":
-                extreme = min(extreme, row["low"])
-                stop = extreme + 2 * row["ATR"]
-
-                if row["high"] >= stop or row["low"] <= tp:
-                    exit_price = stop if row["high"] >= stop else tp
-                    profit = entry_price - exit_price
-                    capital += profit
-                    trades.append(profit)
-                    position = None
-
-    return capital, trades
-
-# ------------------------
-# RUN
-# ------------------------
-
-if __name__ == "__main__":
-    df = fetch_data()
-    df = resample_3m(df)
-
-    final_capital, trades = backtest(df)
-
-    print("Capital final:", final_capital)
-    print("Trades:", len(trades))
-
-    if trades:
-        winrate = sum(1 for t in trades if t > 0) / len(trades)
-        print("Winrate:", winrate)
-def resample_3m(df):
-    df_3m = df.resample("3min").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    })
-    df_3m.dropna(inplace=True)
-    return df_3m
+def compute_rsi(series,period):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain/loss
+    return 100 - (100/(1+rs))
 
 
-def backtest(df):
+def compute_atr(df,period):
+    high,low,close = df["high"],df["low"],df["close"]
+    tr = pd.concat([
+        high-low,
+        (high-close.shift()).abs(),
+        (low-close.shift()).abs()
+    ],axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
-    df["RSI"] = RSIIndicator(df["close"], window=10).rsi()
-    df["ADX"] = ADXIndicator(df["high"], df["low"], df["close"], window=10).adx()
-    df["ATR"] = AverageTrueRange(df["high"], df["low"], df["close"], window=5).average_true_range()
 
-    capital = 10000
-    position = None
-    entry_price = 0
-    stop = 0
-    tp = 0
-    extreme = 0
-    trades = []
+# ==================== MAIN ====================
 
-    for i in range(20, len(df)):
-        row = df.iloc[i]
+def main():
+    print("Iniciando optimización ETHUSDT...")
 
-        if position is None:
+    df = fetch_with_fallback()
 
-            if row["ADX"] > 20 and row["RSI"] < 30:
-                position = "long"
-                entry_price = row["close"]
-                stop = entry_price - 2 * row["ATR"]
-                tp = entry_price + 2.5 * row["ATR"]
-                extreme = entry_price
+    if df is None or df.empty:
+        print("No se pudieron descargar datos.")
+        return
 
-            elif row["ADX"] > 20 and row["RSI"] > 70:
-                position = "short"
-                entry_price = row["close"]
-                stop = entry_price + 2 * row["ATR"]
-                tp = entry_price - 2.5 * row["ATR"]
-                extreme = entry_price
+    print("Velas descargadas:",len(df))
 
-        else:
+    # Ejemplo simple de cálculo
+    df["RSI"] = compute_rsi(df["close"],10)
+    df["ATR"] = compute_atr(df,10)
 
-            if position == "long":
-                extreme = max(extreme, row["high"])
-                stop = extreme - 2 * row["ATR"]
+    print("Último RSI:",df["RSI"].iloc[-1])
+    print("Último ATR:",df["ATR"].iloc[-1])
 
-                if row["low"] <= stop or row["high"] >= tp:
-                    exit_price = stop if row["low"] <= stop else tp
-                    profit = exit_price - entry_price
-                    capital += profit
-                    trades.append(profit)
-                    position = None
-
-            elif position == "short":
-                extreme = min(extreme, row["low"])
-                stop = extreme + 2 * row["ATR"]
-
-                if row["high"] >= stop or row["low"] <= tp:
-                    exit_price = stop if row["high"] >= stop else tp
-                    profit = entry_price - exit_price
-                    capital += profit
-                    trades.append(profit)
-                    position = None
-
-    return capital, trades
+    print("Proceso completado correctamente.")
 
 
 if __name__ == "__main__":
-    df = fetch_data()
-    df = resample_3m(df)
-    final_capital, trades = backtest(df)
-
-    print("Capital final:", final_capital)
-    print("Trades:", len(trades))
-
-    if trades:
-        winrate = sum(1 for t in trades if t > 0) / len(trades)
-        print("Winrate:", winrate)
+    main()
