@@ -22,4 +22,4 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run backtest
-        run: python backtest_eth_3m_dual.py
+        run: python run: backtest.py
